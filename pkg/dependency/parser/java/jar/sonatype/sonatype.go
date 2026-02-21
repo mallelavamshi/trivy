@@ -1,6 +1,7 @@
 package sonatype
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -83,7 +84,10 @@ func New(opts ...Option) Sonatype {
 }
 
 func (s Sonatype) Exists(groupID, artifactID string) (bool, error) {
-	req, err := http.NewRequest(http.MethodGet, s.baseURL, http.NoBody)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.baseURL, http.NoBody)
 	if err != nil {
 		return false, xerrors.Errorf("unable to initialize HTTP client: %w", err)
 	}
@@ -107,8 +111,10 @@ func (s Sonatype) Exists(groupID, artifactID string) (bool, error) {
 }
 
 func (s Sonatype) SearchBySHA1(sha1 string) (jar.Properties, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 
-	req, err := http.NewRequest(http.MethodGet, s.baseURL, http.NoBody)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.baseURL, http.NoBody)
 	if err != nil {
 		return jar.Properties{}, xerrors.Errorf("unable to initialize HTTP client: %w", err)
 	}
@@ -154,7 +160,10 @@ func (s Sonatype) SearchBySHA1(sha1 string) (jar.Properties, error) {
 }
 
 func (s Sonatype) SearchByArtifactID(artifactID, _ string) (string, error) {
-	req, err := http.NewRequest(http.MethodGet, s.baseURL, http.NoBody)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.baseURL, http.NoBody)
 	if err != nil {
 		return "", xerrors.Errorf("unable to initialize HTTP client: %w", err)
 	}

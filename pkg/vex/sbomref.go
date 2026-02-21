@@ -10,100 +10,59 @@ import (
 	"github.com/samber/lo"
 	"golang.org/x/xerrors"
 
-	ftypes "github.com/aquasecurity/trivy/pkg/fanal/types"
-	"github.com/aquasecurity/trivy/pkg/log"
-	"github.com/aquasecurity/trivy/pkg/sbom/core"
-	"github.com/aquasecurity/trivy/pkg/types"
+	types "github.com/aquasecurity/trivy/pkg/types"
 )
 
-type SBOMReferenceSet struct {
-	VEXes []VEX
-}
-
-func NewSBOMReferenceSet(report *types.Report) (*SBOMReferenceSet, error) {
-	if report.ArtifactType != ftypes.TypeCycloneDX {
-		return nil, xerrors.Errorf("externalReferences can only be used when scanning CycloneDX SBOMs: %w", report.ArtifactType)
-	}
-
-	ctx := log.WithContextPrefix(context.Background(), "vex")
-	ctx = log.WithContextAttrs(ctx, log.String("type", "sbom_reference"))
-
-	externalRefs := report.BOM.ExternalReferences()
-	urls := parseToURLs(externalRefs)
-
-	v, err := retrieveExternalVEXDocuments(ctx, urls, report)
-	if err != nil {
-		return nil, xerrors.Errorf("failed to fetch external VEX documents: %w", err)
-	} else if v == nil {
-		return nil, nil
-	}
-
-	return &SBOMReferenceSet{VEXes: v}, nil
-}
-
-func parseToURLs(refs []core.ExternalReference) []*url.URL {
-	return lo.FilterMap(refs, func(ref core.ExternalReference, _ int) (*url.URL, bool) {
-		if ref.Type != core.ExternalReferenceVEX {
-			return nil, false
-		}
-		val, err := url.Parse(ref.URL)
-		if err != nil || (val.Scheme != "https" && val.Scheme != "http") {
-			// do not concern ourselves with relative URLs at this point
-			return nil, false
-		}
-		return val, true
-	})
-}
-
-func retrieveExternalVEXDocuments(ctx context.Context, refs []*url.URL, report *types.Report) ([]VEX, error) {
-	var docs []VEX
-	for _, ref := range refs {
-		doc, err := retrieveExternalVEXDocument(ctx, ref, report)
-		if err != nil {
-			return nil, xerrors.Errorf("failed to retrieve external VEX document: %w", err)
-		}
-		docs = append(docs, doc)
-	}
-	log.DebugContext(ctx, "Retrieved external VEX documents", log.Int("count", len(docs)))
-
-	if len(docs) == 0 {
-		log.DebugContext(ctx, "No external VEX documents found")
-		return nil, nil
-	}
-	return docs, nil
-
+type VEX interface {
+	IsNotAffected(report *types.Report) bool
 }
 
 func retrieveExternalVEXDocument(ctx context.Context, vexUrl *url.URL, report *types.Report) (VEX, error) {
 	log.DebugContext(ctx, "Retrieving external VEX document", log.String("url", vexUrl.String()))
 
-	res, err := http.Get(vexUrl.String())
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, vexUrl.String(), http.NoBody)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to create request: %w", err)
+	}
+	res, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, xerrors.Errorf("unable to fetch file via HTTP: %w", err)
 	}
 	defer res.Body.Close()
 
 	if res.StatusCode != http.StatusOK {
-		return nil, xerrors.Errorf("did not receive 2xx status code: %w", res.StatusCode)
+		return nil, xerrors.Errorf("unable to fetch file via HTTP: status %s", res.Status)
 	}
 
-	val, err := io.ReadAll(res.Body)
+	body, err := io.ReadAll(res.Body)
 	if err != nil {
-		return nil, xerrors.Errorf("unable to read response into memory: %w", err)
+		return nil, xerrors.Errorf("failed to read VEX document: %w", err)
 	}
 
-	v, err := decodeVEX(bytes.NewReader(val), vexUrl.String(), report)
-	if err != nil {
-		return nil, xerrors.Errorf("unable to load VEX from external reference: %w", err)
+	if bytes.HasPrefix(body, []byte("{")) {
+		return NewOpenVEX(body)
 	}
-	return v, nil
+
+	return NewCSAF(body)
 }
 
-func (set *SBOMReferenceSet) NotAffected(vuln types.DetectedVulnerability, product, subComponent *core.Component) (types.ModifiedFinding, bool) {
-	for _, vex := range set.VEXes {
-		if m, notAffected := vex.NotAffected(vuln, product, subComponent); notAffected {
-			return m, notAffected
+func EvaluateVEX(ctx context.Context, vexURLs []*url.URL, report *types.Report) (bool, error) {
+	vexes, err := lo.MapErr(vexURLs, func(vexUrl *url.URL, _ int) (VEX, error) {
+		switch vexUrl.Scheme {
+		case "http", "https":
+			return retrieveExternalVEXDocument(ctx, vexUrl, report)
+		case "file":
+			return NewCSAFFile(vexUrl)
+		default:
+			return nil, xerrors.Errorf("invalid scheme for external VEX document: %s", vexUrl.Scheme)
 		}
+	})
+	if err != nil {
+		return false, err
 	}
-	return types.ModifiedFinding{}, false
+
+	isNotAffected := lo.SomeBy(vexes, func(vex VEX) bool {
+		return vex.IsNotAffected(report)
+	})
+	return isNotAffected, nil
 }
